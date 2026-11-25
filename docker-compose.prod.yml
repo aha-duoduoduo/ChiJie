@@ -1,0 +1,23 @@
+name: chijie
+
+services:
+  chijie:
+    image: "${CHIJIE_IMAGE:?set CHIJIE_IMAGE in .env}"
+    container_name: chijie
+    restart: unless-stopped
+    ports:
+      - "${CHIJIE_PROXY_HOST:-127.0.0.1}:${CHIJIE_PROXY_PORT:-18080}:8080"
+      - "${CHIJIE_ADMIN_HOST:-127.0.0.1}:${CHIJIE_ADMIN_PORT:-19090}:9090"
+      - "${CHIJIE_SOCKS_HOST:-127.0.0.1}:${CHIJIE_SOCKS_PORT:-11080}:1080/tcp"
+      - "${CHIJIE_SOCKS_HOST:-127.0.0.1}:${CHIJIE_SOCKS_PORT:-11080}:1080/udp"
+    volumes:
+      - "${CHIJIE_CONFIG_DIR:-./configs}:/config"
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

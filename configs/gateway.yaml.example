@@ -1,0 +1,92 @@
+server:
+  listen: ":8080"
+  # 是否允许代理和中继拨向私网/回环地址。默认 false 防 SSRF。
+  # 仅在确实需要代理到内网服务时设为 true。
+  allow_private_targets: false
+  # TLS 配置（生产环境启用）
+  # tls:
+  #   cert: "/etc/ssl/cert.pem"
+  #   key: "/etc/ssl/key.pem"
+
+admin:
+  # 默认仅监听 127.0.0.1，避免管理面板暴露到公网。
+  # 若 password 为空，admin.listen 必须为 127.0.0.1/localhost，否则启动会被拒绝。
+  listen: "127.0.0.1:9090"
+  # 管理员密码。留空仅在 admin.listen 为本机时被允许。
+  password: ""
+  # JWT 签名密钥。必须设置且长度 >= 16。禁止使用占位字符串。
+  jwt_secret: ""
+  # token 过期时间
+  jwt_expire: "24h"
+  # 登录失败速率限制：login_window 内累计 login_max_failures 次失败后锁定 login_lockout。
+  login_max_failures: 5
+  login_window: "60s"
+  login_lockout: "5m"
+  # 默认按直接连接方 IP 限速。仅填写会清理转发头的受信代理 CIDR。
+  trusted_proxies: []
+
+socks:
+  enabled: true
+  listen: ":1080"
+  # 客户端使用的 TCP/UDP 地址；公网部署时改为实际域名和端口。
+  advertise_address: "127.0.0.1:1080"
+  # Optional local SOCKS adapter: send authenticated traffic over WSS.
+  # upstream_url: "wss://proxy.example.com/relay/v1"
+  # upstream_token: ""
+
+# Linux 主机流量入口。需要 host 网络、/dev/net/tun 和 NET_ADMIN。
+# 与 SOCKS 客户端入口共用上面的 WSS 上游地址和令牌。
+tun:
+  enabled: false
+  # egress:
+  #   direct: true
+  # 可选：interface、ipv4、ipv6、ipv6_enabled、mtu、bypass_cidrs。
+
+health_check:
+  interval: "30s"
+  timeout: "5s"
+  url: "https://www.google.com/generate_204"
+  max_fail: 3
+
+proxy:
+  # 单次 /proxy 通过某个出口访问目标站点时等待响应头的超时。
+  response_header_timeout: "3s"
+  # 单次 /proxy 所有尝试与重试等待共用的总超时。
+  total_timeout: "30s"
+  # 单次 /proxy 出口执行失败时，最多尝试多少个可用静态/订阅节点。
+  max_attempts: 5
+  # follow_redirects=true 时，单次请求最多跟随多少次 HTTP redirect。
+  max_redirects: 5
+  # 可用节点都失败后，是否继续尝试同地区同类型模板节点。
+  template_fallback_after_attempts: true
+  # 在 Traffic 请求详情添加，或在 System 管理。见 docs/domain-retries.md。
+  domain_retries: []
+
+traffic:
+  # Traffic 请求日志按天写入 configs/.runtime/traffic；只加载最近 1000 条到内存。
+  persistence:
+    enabled: true
+    retention_days: 7
+  failure_grouping:
+    enabled: true
+    url_normalization:
+      enabled: true
+      rules:
+        # Admin 请求详情里也可以用可视化编辑器生成同类规则。
+        - name: "hls-signed-query"
+          match:
+            host_pattern: "*.cdn.example.com"
+            path_pattern: "/media/*/segments/*/playlist.m3u8"
+          query:
+            drop_keys:
+              - vendtime
+              - vhash
+            sort: true
+  # 命中的 200 响应会按 host + path + 出口地区折叠展示，并从有效指标中排除。
+  success_folding:
+    enabled: true
+    rules: []
+
+log:
+  level: "info"
+  file: ""  # 空则输出到 stdout

@@ -1,0 +1,1082 @@
+package pool
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"chijie/internal/dialer"
+	"chijie/internal/dnsresolver"
+	"chijie/internal/netguard"
+	"chijie/internal/util"
+
+	"gopkg.in/yaml.v3"
+)
+
+// SubscriptionParser 订阅解析器
+type SubscriptionParser struct {
+	client           *http.Client
+	allowPrivateHost bool
+}
+
+const MaxSubscriptionBodyBytes = 4 * 1024 * 1024
+const subscriptionUserAgent = "clash-verge/v2.0.0"
+
+// SubscriptionParserOptions 控制订阅拉取的网络安全边界。
+type SubscriptionParserOptions struct {
+	AllowPrivateHost bool
+}
+
+func NewSubscriptionParser() *SubscriptionParser {
+	return NewSubscriptionParserWithOptions(SubscriptionParserOptions{})
+}
+
+func NewSubscriptionParserWithOptions(options SubscriptionParserOptions) *SubscriptionParser {
+	baseDial := dnsresolver.NewDialer(10 * time.Second).DialContext
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           netguard.Guard(baseDial, options.AllowPrivateHost),
+		ForceAttemptHTTP2:     false,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
+	}
+
+	return &SubscriptionParser{
+		allowPrivateHost: options.AllowPrivateHost,
+		client: &http.Client{
+			Timeout:       45 * time.Second,
+			Transport:     transport,
+			CheckRedirect: subscriptionRedirectChecker(options.AllowPrivateHost),
+		},
+	}
+}
+
+// Fetch 拉取并解析订阅链接
+func (p *SubscriptionParser) Fetch(subURL string) ([]dialer.Node, error) {
+	return p.FetchContext(context.Background(), subURL)
+}
+
+func (p *SubscriptionParser) FetchContext(ctx context.Context, subURL string) ([]dialer.Node, error) {
+	defer p.client.CloseIdleConnections()
+	urls := splitSubscriptionURLs(subURL)
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("subscription url is empty")
+	}
+	if len(urls) == 1 {
+		return p.fetchOne(ctx, urls[0])
+	}
+
+	var allNodes []dialer.Node
+	var failures []string
+	for _, item := range urls {
+		nodes, err := p.fetchOne(ctx, item)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", redactSubscriptionURL(item), err))
+			continue
+		}
+		allNodes = append(allNodes, nodes...)
+	}
+	if len(allNodes) > 0 {
+		if len(failures) > 0 {
+			log.Printf("subscription partial failure: %s", strings.Join(failures, "; "))
+		}
+		return allNodes, nil
+	}
+	if len(failures) > 0 {
+		return nil, fmt.Errorf("all subscription urls failed: %s", strings.Join(failures, "; "))
+	}
+	return nil, fmt.Errorf("subscription returned no nodes")
+}
+
+func (p *SubscriptionParser) fetchOne(ctx context.Context, subURL string) ([]dialer.Node, error) {
+	if err := validateSubscriptionURL(ctx, subURL, p.allowPrivateHost); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, subURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create subscription request: %w", err)
+	}
+	req.Header.Set("User-Agent", subscriptionUserAgent)
+	req.Header.Set("Accept", "text/plain, application/yaml, application/x-yaml, application/json, */*")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, subscriptionFetchError(subURL, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := readSubscriptionBody(resp, MaxSubscriptionBodyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read subscription body: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("subscription returned %d", resp.StatusCode)
+	}
+
+	content := strings.TrimSpace(string(body))
+
+	// 尝试 Clash YAML 格式
+	if looksLikeClashYAML(content) {
+		return p.parseClashYAML([]byte(content))
+	}
+
+	// 兼容未 Base64 包装的 URI 列表
+	if strings.Contains(content, "://") {
+		return p.parseURIList(content)
+	}
+
+	// 尝试 Base64 解码
+	decoded, err := decodeBase64Flexible(content)
+	if err != nil {
+		return nil, fmt.Errorf("cannot decode subscription: not Clash YAML or Base64")
+	}
+
+	return p.parseURIList(decoded)
+}
+
+func looksLikeClashYAML(content string) bool {
+	content = strings.TrimSpace(content)
+	return strings.HasPrefix(content, "proxies:") ||
+		strings.Contains(content, "\nproxies:") ||
+		strings.Contains(content, "\r\nproxies:")
+}
+
+func subscriptionFetchError(raw string, err error) error {
+	redacted := redactSubscriptionURL(raw)
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return fmt.Errorf("fetch %s failed: %w", redacted, urlErr.Err)
+	}
+	message := strings.ReplaceAll(err.Error(), raw, redacted)
+	return fmt.Errorf("fetch %s failed: %s", redacted, message)
+}
+
+func validateSubscriptionURL(ctx context.Context, raw string, allowPrivateHost bool) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("parse subscription url: %w", err)
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return fmt.Errorf("subscription url must use http or https")
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("subscription url has no host")
+	}
+	if !allowPrivateHost {
+		if err := netguard.CheckHost(ctx, parsed.Hostname()); err != nil {
+			return fmt.Errorf("subscription host is not allowed: %w", err)
+		}
+	}
+	return nil
+}
+
+func subscriptionRedirectChecker(allowPrivateHost bool) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		if err := validateSubscriptionURL(req.Context(), req.URL.String(), allowPrivateHost); err != nil {
+			return fmt.Errorf("subscription redirect is not allowed: %w", err)
+		}
+		return nil
+	}
+}
+
+func readSubscriptionBody(resp *http.Response, limit int64) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, nil
+	}
+	if limit <= 0 {
+		return io.ReadAll(resp.Body)
+	}
+	if resp.ContentLength > limit {
+		return nil, fmt.Errorf("subscription body exceeds %d bytes", limit)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("subscription body exceeds %d bytes", limit)
+	}
+	return body, nil
+}
+
+func splitSubscriptionURLs(raw string) []string {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ',' || r == '|'
+	})
+
+	urls := make([]string, 0, len(parts))
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item != "" {
+			urls = append(urls, item)
+		}
+	}
+	return urls
+}
+
+func redactSubscriptionURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "subscription-url"
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+// parseClashYAML 解析 Clash 格式的 YAML 订阅
+func (p *SubscriptionParser) parseClashYAML(data []byte) ([]dialer.Node, error) {
+	var config struct {
+		Proxies []ClashProxy `yaml:"proxies"`
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("parse clash yaml: %w", err)
+	}
+
+	nodes := make([]dialer.Node, 0, len(config.Proxies))
+	for _, proxy := range config.Proxies {
+		node, err := clashProxyToNode(&proxy)
+		if err != nil {
+			log.Printf("skip proxy %s: %v", proxy.Name, err)
+			continue
+		}
+		nodes = append(nodes, *node)
+	}
+
+	return nodes, nil
+}
+
+// ClashProxy Clash 代理配置
+type ClashProxy struct {
+	Name              string `yaml:"name"`
+	Type              string `yaml:"type"`
+	Server            string `yaml:"server"`
+	Port              any    `yaml:"port"`
+	Cipher            string `yaml:"cipher"`
+	Password          string `yaml:"password"`
+	UUID              string `yaml:"uuid"`
+	AlterID           any    `yaml:"alterId"`
+	Security          string `yaml:"security"`
+	TLS               bool   `yaml:"tls"`
+	SkipCertVerify    bool   `yaml:"skip-cert-verify"`
+	SNI               string `yaml:"sni"`
+	ServerName        string `yaml:"servername"`
+	ClientFingerprint string `yaml:"client-fingerprint"`
+	Fingerprint       string `yaml:"fingerprint"`
+	ALPN              any    `yaml:"alpn"`
+	Network           string `yaml:"network"`
+	Flow              string `yaml:"flow"`
+	Username          string `yaml:"username"`
+	UDP               bool   `yaml:"udp"`
+	Plugin            string `yaml:"plugin"`
+	PluginOpts        string `yaml:"plugin-opts"`
+	Auth              string `yaml:"auth"`
+	AuthStr           string `yaml:"auth-str"`
+	CongestionControl string `yaml:"congestion-control"`
+	CongestionCtl     string `yaml:"congestion-controller"`
+	UDPRelayMode      string `yaml:"udp-relay-mode"`
+	UDPOverStream     bool   `yaml:"udp-over-stream"`
+	ZeroRTTHandshake  bool   `yaml:"zero-rtt-handshake"`
+	ReduceRTT         bool   `yaml:"reduce-rtt"`
+	Heartbeat         string `yaml:"heartbeat"`
+	HeartbeatInterval string `yaml:"heartbeat-interval"`
+	MinIdleSession    int    `yaml:"min-idle-session"`
+	IdleCheckInterval string `yaml:"idle-session-check-interval"`
+	IdleTimeout       string `yaml:"idle-session-timeout"`
+	Up                any    `yaml:"up"`
+	Down              any    `yaml:"down"`
+	Ports             any    `yaml:"ports"`
+	HopInterval       string `yaml:"hop-interval"`
+	Obfs              string `yaml:"obfs"`
+	ObfsPassword      string `yaml:"obfs-password"`
+	WSOpts            *struct {
+		Path    string            `yaml:"path"`
+		Headers map[string]string `yaml:"headers"`
+	} `yaml:"ws-opts"`
+	GrpcOpts *struct {
+		GrpcServiceName string `yaml:"grpc-service-name"`
+	} `yaml:"grpc-opts"`
+	XHTTPOpts *struct {
+		Path             string            `yaml:"path"`
+		Mode             string            `yaml:"mode"`
+		Host             string            `yaml:"host"`
+		Method           string            `yaml:"method"`
+		Headers          map[string]string `yaml:"headers"`
+		NoGRPCHeader     bool              `yaml:"no-grpc-header"`
+		NoSSEHeader      bool              `yaml:"no-sse-header"`
+		DownloadSettings *struct {
+			Path       string `yaml:"path"`
+			Server     string `yaml:"server"`
+			Port       any    `yaml:"port"`
+			ServerName string `yaml:"servername"`
+		} `yaml:"download-settings"`
+	} `yaml:"xhttp-opts"`
+	RealityOpts *struct {
+		PublicKey string `yaml:"public-key"`
+		ShortID   string `yaml:"short-id"`
+	} `yaml:"reality-opts"`
+}
+
+func clashProxyToNode(proxy *ClashProxy) (*dialer.Node, error) {
+	node := &dialer.Node{
+		Name:   proxy.Name,
+		Server: proxy.Server,
+		Port:   parseInterfaceInt(proxy.Port),
+		Extra:  make(map[string]string),
+	}
+
+	switch proxy.Type {
+	case "ss":
+		node.Type = "ss"
+		node.Password = proxy.Password
+		node.Extra["cipher"] = proxy.Cipher
+		setExtra(node.Extra, "plugin", normalizeSSPlugin(proxy.Plugin))
+		setExtra(node.Extra, "plugin_opts", proxy.PluginOpts)
+
+	case "vmess":
+		node.Type = "vmess"
+		node.Extra["uuid"] = proxy.UUID
+		node.Extra["security"] = proxy.Security
+		node.Extra["alter_id"] = strconv.Itoa(parseInterfaceInt(proxy.AlterID))
+		applyClashCommonExtras(node, proxy)
+
+	case "trojan":
+		node.Type = "trojan"
+		node.Password = proxy.Password
+		applyClashCommonExtras(node, proxy)
+
+	case "vless":
+		node.Type = "vless"
+		node.Extra["uuid"] = proxy.UUID
+		node.Extra["flow"] = proxy.Flow
+		applyClashCommonExtras(node, proxy)
+
+	case "hysteria2", "hy2":
+		node.Type = "hysteria2"
+		node.Password = util.FirstNonEmpty(proxy.Password, proxy.Auth, proxy.AuthStr)
+		applyClashCommonExtras(node, proxy)
+		setExtra(node.Extra, "up_mbps", scalarToString(proxy.Up))
+		setExtra(node.Extra, "down_mbps", scalarToString(proxy.Down))
+		setExtra(node.Extra, "ports", stringListToCSV(proxy.Ports))
+		setExtra(node.Extra, "hop_interval", proxy.HopInterval)
+		setExtra(node.Extra, "obfs", proxy.Obfs)
+		setExtra(node.Extra, "obfs_password", proxy.ObfsPassword)
+
+	case "anytls":
+		node.Type = "anytls"
+		node.Password = proxy.Password
+		applyClashCommonExtras(node, proxy)
+		setExtra(node.Extra, "idle_session_check_interval", proxy.IdleCheckInterval)
+		setExtra(node.Extra, "idle_session_timeout", proxy.IdleTimeout)
+		if proxy.MinIdleSession > 0 {
+			node.Extra["min_idle_session"] = strconv.Itoa(proxy.MinIdleSession)
+		}
+
+	case "tuic":
+		node.Type = "tuic"
+		node.Password = proxy.Password
+		node.Extra["uuid"] = proxy.UUID
+		applyClashCommonExtras(node, proxy)
+		setExtra(node.Extra, "congestion_control", util.FirstNonEmpty(proxy.CongestionControl, proxy.CongestionCtl))
+		setExtra(node.Extra, "udp_relay_mode", proxy.UDPRelayMode)
+		setExtra(node.Extra, "heartbeat", util.FirstNonEmpty(proxy.Heartbeat, proxy.HeartbeatInterval))
+		if proxy.UDPOverStream {
+			node.Extra["udp_over_stream"] = "true"
+		}
+		if proxy.ZeroRTTHandshake || proxy.ReduceRTT {
+			node.Extra["zero_rtt_handshake"] = "true"
+		}
+
+	case "socks5":
+		node.Type = "socks5"
+		node.Username = proxy.Username
+		node.Password = proxy.Password
+
+	case "http":
+		node.Type = "http_proxy"
+		node.Username = proxy.Username
+		node.Password = proxy.Password
+
+	default:
+		return nil, fmt.Errorf("unsupported type: %s", proxy.Type)
+	}
+
+	return node, nil
+}
+
+func applyClashCommonExtras(node *dialer.Node, proxy *ClashProxy) {
+	setExtra(node.Extra, "network", proxy.Network)
+	if proxy.TLS {
+		node.Extra["tls"] = "true"
+	}
+	setExtra(node.Extra, "sni", util.FirstNonEmpty(proxy.SNI, proxy.ServerName))
+	if proxy.SkipCertVerify {
+		node.Extra["skip_verify"] = "true"
+	}
+	setExtra(node.Extra, "client_fingerprint", proxy.ClientFingerprint)
+	setExtra(node.Extra, "certificate_fingerprint", proxy.Fingerprint)
+	setExtra(node.Extra, "alpn", stringListToCSV(proxy.ALPN))
+
+	if proxy.WSOpts != nil {
+		setExtra(node.Extra, "path", proxy.WSOpts.Path)
+		if len(proxy.WSOpts.Headers) > 0 {
+			if host := util.FirstNonEmpty(proxy.WSOpts.Headers["Host"], proxy.WSOpts.Headers["host"]); host != "" {
+				node.Extra["host"] = host
+			}
+			if encoded, err := json.Marshal(proxy.WSOpts.Headers); err == nil {
+				node.Extra["headers"] = string(encoded)
+			}
+		}
+	}
+	if proxy.GrpcOpts != nil {
+		setExtra(node.Extra, "service_name", proxy.GrpcOpts.GrpcServiceName)
+	}
+	if proxy.XHTTPOpts != nil {
+		applyClashXHTTPExtras(node, proxy.XHTTPOpts)
+	}
+	if proxy.RealityOpts != nil {
+		node.Extra["security"] = "reality"
+		setExtra(node.Extra, "public_key", proxy.RealityOpts.PublicKey)
+		setExtra(node.Extra, "short_id", proxy.RealityOpts.ShortID)
+	}
+}
+
+func applyClashXHTTPExtras(node *dialer.Node, opts *struct {
+	Path             string            `yaml:"path"`
+	Mode             string            `yaml:"mode"`
+	Host             string            `yaml:"host"`
+	Method           string            `yaml:"method"`
+	Headers          map[string]string `yaml:"headers"`
+	NoGRPCHeader     bool              `yaml:"no-grpc-header"`
+	NoSSEHeader      bool              `yaml:"no-sse-header"`
+	DownloadSettings *struct {
+		Path       string `yaml:"path"`
+		Server     string `yaml:"server"`
+		Port       any    `yaml:"port"`
+		ServerName string `yaml:"servername"`
+	} `yaml:"download-settings"`
+}) {
+	setExtra(node.Extra, "path", opts.Path)
+	setExtra(node.Extra, "xhttp_path", opts.Path)
+	setExtra(node.Extra, "xhttp_mode", opts.Mode)
+	setExtra(node.Extra, "xhttp_host", opts.Host)
+	setExtra(node.Extra, "xhttp_method", opts.Method)
+	if opts.NoGRPCHeader {
+		node.Extra["xhttp_no_grpc_header"] = "true"
+	}
+	if opts.NoSSEHeader {
+		node.Extra["xhttp_no_sse_header"] = "true"
+	}
+	if len(opts.Headers) > 0 {
+		if encoded, err := json.Marshal(opts.Headers); err == nil {
+			node.Extra["xhttp_headers"] = string(encoded)
+		}
+	}
+	if opts.DownloadSettings != nil {
+		setExtra(node.Extra, "xhttp_download_path", opts.DownloadSettings.Path)
+		setExtra(node.Extra, "xhttp_download_server", opts.DownloadSettings.Server)
+		setExtra(node.Extra, "xhttp_download_port", scalarToString(opts.DownloadSettings.Port))
+		setExtra(node.Extra, "xhttp_download_servername", opts.DownloadSettings.ServerName)
+	}
+}
+
+// parseURIList 解析 Base64 解码后的 URI 列表（每行一个 URI）
+func (p *SubscriptionParser) parseURIList(content string) ([]dialer.Node, error) {
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	nodes := make([]dialer.Node, 0, len(lines))
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		node, err := parseURI(line)
+		if err != nil {
+			log.Printf("skip uri: %v", err)
+			continue
+		}
+		nodes = append(nodes, *node)
+	}
+
+	if len(nodes) == 0 {
+		return nil, fmt.Errorf("subscription URI list has no supported nodes")
+	}
+	return nodes, nil
+}
+
+// parseURI 解析单个代理 URI
+func parseURI(uri string) (*dialer.Node, error) {
+	lowerURI := strings.ToLower(uri)
+	if strings.HasPrefix(lowerURI, "ss://") {
+		return parseSSURI(uri)
+	}
+	if strings.HasPrefix(lowerURI, "vmess://") {
+		return parseVMessURI(uri)
+	}
+	if strings.HasPrefix(lowerURI, "trojan://") {
+		return parseTrojanURI(uri)
+	}
+	if strings.HasPrefix(lowerURI, "vless://") {
+		return parseVLESSURI(uri)
+	}
+	if strings.HasPrefix(lowerURI, "hysteria2://") || strings.HasPrefix(lowerURI, "hy2://") {
+		return parseHysteria2URI(uri)
+	}
+	if strings.HasPrefix(lowerURI, "anytls://") {
+		return parseAnyTLSURI(uri)
+	}
+	if strings.HasPrefix(lowerURI, "tuic://") {
+		return parseTUICURI(uri)
+	}
+	return nil, fmt.Errorf("unsupported uri scheme: %s", uri[:min(10, len(uri))])
+}
+
+// parseSSURI 解析 ss:// URI
+// 格式: ss://base64(method:password)@server:port#name
+// 或:   ss://base64(method:password@server:port)#name
+func parseSSURI(uri string) (*dialer.Node, error) {
+	uri = strings.TrimPrefix(uri, "ss://")
+
+	// 提取 fragment（节点名称）
+	name := ""
+	if idx := strings.Index(uri, "#"); idx != -1 {
+		name, _ = url.QueryUnescape(uri[idx+1:])
+		uri = uri[:idx]
+	}
+	query := url.Values{}
+	if idx := strings.Index(uri, "?"); idx != -1 {
+		query, _ = url.ParseQuery(uri[idx+1:])
+		uri = uri[:idx]
+	}
+
+	var server, cipher, password string
+	var port int
+
+	if idx := strings.Index(uri, "@"); idx != -1 {
+		// 格式: base64(method:password)@server:port
+		userInfo := uri[:idx]
+		decoded, err := decodeBase64Flexible(userInfo)
+		if err != nil || !strings.Contains(decoded, ":") {
+			decoded, err = url.QueryUnescape(userInfo)
+			if err != nil {
+				return nil, fmt.Errorf("decode ss userinfo: %w", err)
+			}
+		}
+		parts := strings.SplitN(decoded, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid ss userinfo: %s", decoded)
+		}
+		cipher = parts[0]
+		password = parts[1]
+
+		host, parsedPort, err := parseSSHostPort(uri[idx+1:])
+		if err != nil {
+			return nil, fmt.Errorf("parse ss host:port: %w", err)
+		}
+		server = host
+		port = parsedPort
+	} else {
+		// 格式: base64(method:password@server:port)
+		decoded, err := decodeBase64Flexible(uri)
+		if err != nil {
+			return nil, fmt.Errorf("decode ss uri: %w", err)
+		}
+		parts := strings.SplitN(decoded, "@", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid ss uri: %s", decoded)
+		}
+		methodPass := strings.SplitN(parts[0], ":", 2)
+		if len(methodPass) != 2 {
+			return nil, fmt.Errorf("invalid ss method:password")
+		}
+		cipher = methodPass[0]
+		password = methodPass[1]
+
+		host, parsedPort, err := parseSSHostPort(parts[1])
+		if err != nil {
+			return nil, fmt.Errorf("parse ss host:port: %w", err)
+		}
+		server = host
+		port = parsedPort
+	}
+
+	if name == "" {
+		name = fmt.Sprintf("%s:%d", server, port)
+	}
+
+	node := &dialer.Node{
+		Name:     name,
+		Type:     "ss",
+		Server:   server,
+		Port:     port,
+		Password: password,
+		Extra:    map[string]string{"cipher": cipher},
+	}
+	return node, addSSQueryOptions(query, node)
+}
+
+func parseSSHostPort(value string) (string, int, error) {
+	value = strings.TrimSpace(value)
+	if idx := strings.Index(value, "/"); idx != -1 {
+		value = value[:idx]
+	}
+	host, portStr, err := net.SplitHostPort(value)
+	if err != nil {
+		return "", 0, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, err
+	}
+	return host, port, nil
+}
+
+func addSSQueryOptions(query url.Values, node *dialer.Node) error {
+	if plugin := query.Get("plugin"); plugin != "" {
+		plugin, _ = url.QueryUnescape(plugin)
+		parts := strings.SplitN(plugin, ";", 2)
+		node.Extra["plugin"] = normalizeSSPlugin(parts[0])
+		if len(parts) > 1 {
+			node.Extra["plugin_opts"] = parts[1]
+		}
+	}
+	return nil
+}
+
+func normalizeSSPlugin(plugin string) string {
+	switch strings.ToLower(strings.TrimSpace(plugin)) {
+	case "simple-obfs":
+		return "obfs-local"
+	default:
+		return strings.TrimSpace(plugin)
+	}
+}
+
+// parseVMessURI 解析 vmess:// URI（V2RayN 格式，Base64 JSON）
+func parseVMessURI(uri string) (*dialer.Node, error) {
+	uri = strings.TrimPrefix(uri, "vmess://")
+
+	decoded, err := decodeBase64Flexible(uri)
+	if err != nil {
+		return nil, fmt.Errorf("decode vmess: %w", err)
+	}
+
+	var config struct {
+		V    interface{} `json:"v"`
+		PS   string      `json:"ps"`
+		Add  string      `json:"add"`
+		Port interface{} `json:"port"`
+		ID   string      `json:"id"`
+		Aid  interface{} `json:"aid"`
+		Scy  string      `json:"scy"`
+		Net  string      `json:"net"`
+		Type string      `json:"type"`
+		Host string      `json:"host"`
+		Path string      `json:"path"`
+		TLS  string      `json:"tls"`
+		SNI  string      `json:"sni"`
+		FP   string      `json:"fp"`
+		ALPN string      `json:"alpn"`
+	}
+
+	if err := json.Unmarshal([]byte(decoded), &config); err != nil {
+		return nil, fmt.Errorf("parse vmess json: %w", err)
+	}
+
+	port := 0
+	switch v := config.Port.(type) {
+	case float64:
+		port = int(v)
+	case string:
+		port, _ = strconv.Atoi(v)
+	}
+
+	security := config.Scy
+	if security == "" {
+		security = "auto"
+	}
+
+	name := config.PS
+	if name == "" {
+		name = fmt.Sprintf("%s:%d", config.Add, port)
+	}
+
+	return &dialer.Node{
+		Name:   name,
+		Type:   "vmess",
+		Server: config.Add,
+		Port:   port,
+		Extra: map[string]string{
+			"uuid":        config.ID,
+			"security":    security,
+			"network":     config.Net,
+			"tls":         config.TLS,
+			"sni":         config.SNI,
+			"fingerprint": config.FP,
+			"alpn":        config.ALPN,
+			"host":        config.Host,
+			"path":        config.Path,
+			"alter_id":    strconv.Itoa(parseInterfaceInt(config.Aid)),
+		},
+	}, nil
+}
+
+// parseTrojanURI 解析 trojan:// URI
+// 格式: trojan://password@server:port?sni=xxx#name
+func parseTrojanURI(uri string) (*dialer.Node, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("parse trojan uri: %w", err)
+	}
+
+	password := parsed.User.Username()
+	server := parsed.Hostname()
+	port, _ := strconv.Atoi(parsed.Port())
+
+	name, _ := url.QueryUnescape(parsed.Fragment)
+	if name == "" {
+		name = fmt.Sprintf("%s:%d", server, port)
+	}
+
+	query := parsed.Query()
+	sni := query.Get("sni")
+	if sni == "" {
+		sni = server
+	}
+
+	return &dialer.Node{
+		Name:     name,
+		Type:     "trojan",
+		Server:   server,
+		Port:     port,
+		Password: password,
+		Extra: map[string]string{
+			"tls":          util.FirstNonEmpty(query.Get("security"), "tls"),
+			"sni":          sni,
+			"skip_verify":  util.FirstNonEmpty(query.Get("allowInsecure"), query.Get("insecure")),
+			"network":      query.Get("type"),
+			"host":         query.Get("host"),
+			"path":         query.Get("path"),
+			"service_name": util.FirstNonEmpty(query.Get("serviceName"), query.Get("service_name")),
+			"alpn":         query.Get("alpn"),
+			"fingerprint":  util.FirstNonEmpty(query.Get("fp"), query.Get("fingerprint")),
+		},
+	}, nil
+}
+
+// parseVLESSURI 解析 vless:// URI
+// 格式: vless://uuid@server:port?type=tcp&security=tls&sni=xxx&flow=xxx#name
+func parseVLESSURI(uri string) (*dialer.Node, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("parse vless uri: %w", err)
+	}
+
+	uuid := parsed.User.Username()
+	server := parsed.Hostname()
+	port, _ := strconv.Atoi(parsed.Port())
+
+	name, _ := url.QueryUnescape(parsed.Fragment)
+	if name == "" {
+		name = fmt.Sprintf("%s:%d", server, port)
+	}
+
+	query := parsed.Query()
+
+	extra := map[string]string{
+		"uuid":         uuid,
+		"flow":         query.Get("flow"),
+		"security":     query.Get("security"),
+		"sni":          util.FirstNonEmpty(query.Get("sni"), query.Get("servername")),
+		"network":      query.Get("type"),
+		"host":         query.Get("host"),
+		"path":         query.Get("path"),
+		"service_name": util.FirstNonEmpty(query.Get("serviceName"), query.Get("service_name")),
+		"alpn":         query.Get("alpn"),
+		"fingerprint":  util.FirstNonEmpty(query.Get("fp"), query.Get("fingerprint")),
+		"xhttp_mode":   query.Get("mode"),
+		"xhttp_path":   query.Get("path"),
+		"xhttp_host":   query.Get("host"),
+		"skip_verify":  util.FirstNonEmpty(query.Get("allowInsecure"), query.Get("insecure")),
+		"public_key":   util.FirstNonEmpty(query.Get("pbk"), query.Get("publicKey"), query.Get("public_key")),
+		"short_id":     util.FirstNonEmpty(query.Get("sid"), query.Get("shortId"), query.Get("short_id")),
+	}
+	applyVLESSXHTTPURIExtra(extra, query.Get("extra"))
+
+	return &dialer.Node{
+		Name:   name,
+		Type:   "vless",
+		Server: server,
+		Port:   port,
+		Extra:  extra,
+	}, nil
+}
+
+func applyVLESSXHTTPURIExtra(extra map[string]string, raw string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return
+	}
+	extra["xhttp_extra"] = raw
+	var config struct {
+		DownloadSettings *struct {
+			Path       string `json:"path"`
+			Server     string `json:"server"`
+			Port       any    `json:"port"`
+			ServerName string `json:"servername"`
+		} `json:"downloadSettings"`
+	}
+	if err := json.Unmarshal([]byte(raw), &config); err != nil || config.DownloadSettings == nil {
+		return
+	}
+	setExtra(extra, "xhttp_download_path", config.DownloadSettings.Path)
+	setExtra(extra, "xhttp_download_server", config.DownloadSettings.Server)
+	setExtra(extra, "xhttp_download_port", scalarToString(config.DownloadSettings.Port))
+	setExtra(extra, "xhttp_download_servername", config.DownloadSettings.ServerName)
+}
+
+// parseHysteria2URI 解析 hysteria2:// / hy2:// URI
+// 常见格式: hysteria2://password@server:port?sni=example.com&insecure=1&obfs=salamander&obfs-password=xxx#name
+func parseHysteria2URI(uri string) (*dialer.Node, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("parse hysteria2 uri: %w", err)
+	}
+
+	password := parsed.User.Username()
+	server := parsed.Hostname()
+	port, _ := strconv.Atoi(parsed.Port())
+
+	name, _ := url.QueryUnescape(parsed.Fragment)
+	if name == "" {
+		name = fmt.Sprintf("%s:%d", server, port)
+	}
+
+	query := parsed.Query()
+	return &dialer.Node{
+		Name:     name,
+		Type:     "hysteria2",
+		Server:   server,
+		Port:     port,
+		Password: password,
+		Extra: map[string]string{
+			"tls":           "true",
+			"sni":           util.FirstNonEmpty(query.Get("sni"), query.Get("peer")),
+			"skip_verify":   util.FirstNonEmpty(query.Get("insecure"), query.Get("allowInsecure")),
+			"alpn":          query.Get("alpn"),
+			"obfs":          query.Get("obfs"),
+			"obfs_password": util.FirstNonEmpty(query.Get("obfs-password"), query.Get("obfs_password")),
+			"up_mbps":       util.FirstNonEmpty(query.Get("upmbps"), query.Get("up_mbps"), query.Get("up")),
+			"down_mbps":     util.FirstNonEmpty(query.Get("downmbps"), query.Get("down_mbps"), query.Get("down")),
+			"ports":         util.FirstNonEmpty(query.Get("mport"), query.Get("ports")),
+			"hop_interval":  util.FirstNonEmpty(query.Get("hop_interval"), query.Get("hop-interval")),
+		},
+	}, nil
+}
+
+// parseAnyTLSURI 解析 anytls:// URI
+// 常见格式: anytls://password@server:port?security=tls&sni=example.com&fp=chrome#name
+func parseAnyTLSURI(uri string) (*dialer.Node, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("parse anytls uri: %w", err)
+	}
+
+	password := ""
+	if parsed.User != nil {
+		password, _ = url.PathUnescape(parsed.User.String())
+	}
+	server := parsed.Hostname()
+	port, _ := strconv.Atoi(parsed.Port())
+
+	name, _ := url.QueryUnescape(parsed.Fragment)
+	if name == "" {
+		name = fmt.Sprintf("%s:%d", server, port)
+	}
+
+	query := parsed.Query()
+	return &dialer.Node{
+		Name:     name,
+		Type:     "anytls",
+		Server:   server,
+		Port:     port,
+		Password: util.FirstNonEmpty(password, query.Get("password")),
+		Extra: map[string]string{
+			"security":                    util.FirstNonEmpty(query.Get("security"), query.Get("tls"), "tls"),
+			"sni":                         util.FirstNonEmpty(query.Get("sni"), query.Get("servername"), query.Get("peer")),
+			"fingerprint":                 util.FirstNonEmpty(query.Get("fp"), query.Get("fingerprint"), query.Get("client-fingerprint")),
+			"alpn":                        query.Get("alpn"),
+			"insecure":                    util.FirstNonEmpty(query.Get("insecure"), query.Get("allowInsecure"), query.Get("allow_insecure")),
+			"idle_session_check_interval": query.Get("idle_session_check_interval"),
+			"idle_session_timeout":        query.Get("idle_session_timeout"),
+			"min_idle_session":            query.Get("min_idle_session"),
+		},
+	}, nil
+}
+
+// parseTUICURI 解析 tuic:// URI
+// 常见格式: tuic://uuid:password@server:port?congestion_control=bbr&sni=example.com&alpn=h3#name
+func parseTUICURI(uri string) (*dialer.Node, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("parse tuic uri: %w", err)
+	}
+
+	uuid := ""
+	password := ""
+	if parsed.User != nil {
+		uuid = parsed.User.Username()
+		password, _ = parsed.User.Password()
+	}
+	server := parsed.Hostname()
+	port, _ := strconv.Atoi(parsed.Port())
+
+	name, _ := url.QueryUnescape(parsed.Fragment)
+	if name == "" {
+		name = fmt.Sprintf("%s:%d", server, port)
+	}
+
+	query := parsed.Query()
+	return &dialer.Node{
+		Name:     name,
+		Type:     "tuic",
+		Server:   server,
+		Port:     port,
+		Password: util.FirstNonEmpty(password, query.Get("password")),
+		Extra: map[string]string{
+			"uuid":               util.FirstNonEmpty(uuid, query.Get("uuid")),
+			"security":           util.FirstNonEmpty(query.Get("security"), query.Get("tls"), "tls"),
+			"sni":                util.FirstNonEmpty(query.Get("sni"), query.Get("servername"), query.Get("peer")),
+			"fingerprint":        util.FirstNonEmpty(query.Get("fp"), query.Get("fingerprint"), query.Get("client-fingerprint")),
+			"alpn":               query.Get("alpn"),
+			"insecure":           util.FirstNonEmpty(query.Get("insecure"), query.Get("allowInsecure"), query.Get("allow_insecure")),
+			"congestion_control": util.FirstNonEmpty(query.Get("congestion_control"), query.Get("congestion-control"), query.Get("congestion")),
+			"udp_relay_mode":     util.FirstNonEmpty(query.Get("udp_relay_mode"), query.Get("udp-relay-mode")),
+			"udp_over_stream":    util.FirstNonEmpty(query.Get("udp_over_stream"), query.Get("udp-over-stream")),
+			"zero_rtt_handshake": util.FirstNonEmpty(query.Get("zero_rtt_handshake"), query.Get("zero-rtt-handshake"), query.Get("reduce_rtt"), query.Get("reduce-rtt")),
+			"heartbeat":          util.FirstNonEmpty(query.Get("heartbeat"), query.Get("heartbeat_interval"), query.Get("heartbeat-interval")),
+			"network":            query.Get("network"),
+		},
+	}, nil
+}
+
+// decodeBase64Flexible 灵活解码 Base64（支持标准/URL-safe/有无 padding）
+func decodeBase64Flexible(s string) (string, error) {
+	s = cleanBase64Input(s)
+	// 先尝试标准 Base64
+	if decoded, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return string(decoded), nil
+	}
+	// URL-safe
+	if decoded, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return string(decoded), nil
+	}
+	// 无 padding 标准
+	if decoded, err := base64.RawStdEncoding.DecodeString(s); err == nil {
+		return string(decoded), nil
+	}
+	// 无 padding URL-safe
+	if decoded, err := base64.RawURLEncoding.DecodeString(s); err == nil {
+		return string(decoded), nil
+	}
+	return "", fmt.Errorf("base64 decode failed")
+}
+
+func cleanBase64Input(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+			return -1
+		default:
+			return r
+		}
+	}, strings.TrimSpace(s))
+}
+
+func setExtra(extra map[string]string, key, value string) {
+	if strings.TrimSpace(value) != "" {
+		extra[key] = value
+	}
+}
+
+func parseInterfaceInt(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case string:
+		result, _ := strconv.Atoi(typed)
+		return result
+	default:
+		return 0
+	}
+}
+
+func scalarToString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case int:
+		return strconv.Itoa(typed)
+	case int64:
+		return strconv.FormatInt(typed, 10)
+	case float64:
+		if typed == float64(int(typed)) {
+			return strconv.Itoa(int(typed))
+		}
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func stringListToCSV(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case []string:
+		return strings.Join(typed, ",")
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text := scalarToString(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, ",")
+	default:
+		return scalarToString(typed)
+	}
+}

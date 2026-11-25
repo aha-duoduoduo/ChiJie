@@ -1,0 +1,63 @@
+server:
+  listen: ":8080"
+  allow_private_targets: false
+
+admin:
+  # Docker 内监听所有地址，由 docker-compose 仅映射到宿主机 127.0.0.1:19090。
+  listen: ":9090"
+  password: ""
+  jwt_secret: ""
+  jwt_expire: "24h"
+  login_max_failures: 5
+  login_window: "60s"
+  login_lockout: "5m"
+  # 默认按直接连接方 IP 限速。仅填写会清理转发头的受信代理 CIDR。
+  trusted_proxies: []
+
+socks:
+  enabled: true
+  listen: ":1080"
+  # 与 Docker 默认宿主机映射对应；公网部署时改为实际域名和端口。
+  advertise_address: "127.0.0.1:11080"
+  # Optional local SOCKS adapter: send authenticated traffic over WSS.
+  # upstream_url: "wss://proxy.example.com/relay/v1"
+  # upstream_token: ""
+
+# 整机代理仅在 Linux host 网络部署中启用。
+tun:
+  enabled: false
+  # egress:
+  #   region: "US"
+  #   strategy: "least-latency"
+  # bypass_cidrs: []
+
+health_check:
+  interval: "30s"
+  timeout: "5s"
+  url: "https://www.google.com/generate_204"
+  max_fail: 3
+
+proxy:
+  response_header_timeout: "3s"
+  total_timeout: "30s"
+  max_attempts: 5
+  max_redirects: 5
+  template_fallback_after_attempts: true
+  domain_retries: []
+
+traffic:
+  persistence:
+    enabled: true
+    retention_days: 7
+  failure_grouping:
+    enabled: true
+    url_normalization:
+      enabled: true
+      rules: []
+  success_folding:
+    enabled: true
+    rules: []
+
+log:
+  level: "info"
+  file: ""

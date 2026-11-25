@@ -1,0 +1,470 @@
+package traffic
+
+import (
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Trace is one completed proxy or tunnel request.
+type Trace struct {
+	Attempts       int       `json:"attempts,omitempty"`
+	RetryOutcome   string    `json:"retry_outcome,omitempty"`
+	ID             string    `json:"id"`
+	Timestamp      time.Time `json:"timestamp"`
+	Kind           string    `json:"kind"`
+	Method         string    `json:"method"`
+	URL            string    `json:"url"`
+	Target         string    `json:"target"`
+	Region         string    `json:"region,omitempty"`
+	EgressGroup    string    `json:"egress_group,omitempty"`
+	Strategy       string    `json:"strategy,omitempty"`
+	Residential    bool      `json:"residential,omitempty"`
+	Premium        bool      `json:"premium,omitempty"`
+	EgressPool     string    `json:"egress_pool,omitempty"`
+	EgressNode     string    `json:"egress_node,omitempty"`
+	EgressSource   string    `json:"egress_source,omitempty"`
+	EgressTemplate bool      `json:"egress_template,omitempty"`
+	TLSFingerprint string    `json:"tls_fingerprint,omitempty"`
+	Status         int       `json:"status"`
+	LatencyMS      int64     `json:"latency_ms"`
+	RequestBytes   int64     `json:"request_bytes"`
+	ResponseBytes  int64     `json:"response_bytes"`
+	Error          string    `json:"error,omitempty"`
+}
+
+// Metrics is the aggregate view exposed to the admin UI.
+type Metrics struct {
+	Requests       int64   `json:"requests"`
+	Success        int64   `json:"success"`
+	Failures       int64   `json:"failures"`
+	RawRequests    int64   `json:"raw_requests"`
+	RawFailures    int64   `json:"raw_failures"`
+	IgnoredSuccess int64   `json:"ignored_success"`
+	RequestBytes   int64   `json:"request_bytes"`
+	ResponseBytes  int64   `json:"response_bytes"`
+	ActiveTunnels  int64   `json:"active_tunnels"`
+	RequestsPerMin float64 `json:"requests_per_min"`
+	SuccessRate    float64 `json:"success_rate"`
+	AvgLatencyMS   int64   `json:"avg_latency_ms"`
+	P95LatencyMS   int64   `json:"p95_latency_ms"`
+}
+
+// Bucket is one minute of traffic history.
+type Bucket struct {
+	Time         time.Time `json:"time"`
+	Requests     int64     `json:"requests"`
+	Failures     int64     `json:"failures"`
+	AvgLatencyMS int64     `json:"avg_latency_ms"`
+	P95LatencyMS int64     `json:"p95_latency_ms"`
+}
+
+type DisplayTrace struct {
+	Trace
+	GroupKey           string  `json:"group_key,omitempty"`
+	GroupTarget        string  `json:"group_target,omitempty"`
+	GroupCount         int     `json:"group_count,omitempty"`
+	ExcludedFromMetric bool    `json:"excluded_from_metrics,omitempty"`
+	Children           []Trace `json:"children,omitempty"`
+}
+
+type Snapshot struct {
+	Metrics       Metrics        `json:"metrics"`
+	Traces        []Trace        `json:"traces"`
+	DisplayTraces []DisplayTrace `json:"display_traces"`
+	Series        []Bucket       `json:"series"`
+	Config        Config         `json:"config"`
+}
+
+type Store struct {
+	mu            sync.RWMutex
+	capacity      int
+	nextID        int64
+	traces        []Trace
+	startedAt     time.Time
+	activeTunnels int64
+	config        Config
+	persistence   *tracePersistence
+}
+
+func NewStore(capacity int) *Store {
+	if capacity <= 0 {
+		capacity = 1000
+	}
+	return &Store{
+		capacity:  capacity,
+		startedAt: time.Now(),
+		config:    DefaultConfig(),
+	}
+}
+
+func (s *Store) UpdateConfig(cfg Config) {
+	s.mu.Lock()
+	s.config = NormalizeConfig(cfg)
+	s.pruneExpiredLocked(time.Now())
+	persistence := s.persistence
+	retentionDays := s.config.Persistence.RetentionDays
+	s.mu.Unlock()
+	if persistence != nil {
+		if err := persistence.updateRetention(retentionDays); err != nil {
+			// NormalizeConfig guarantees a valid positive default. Keep the current
+			// writer active if an out-of-range runtime update reaches this layer.
+			return
+		}
+	}
+}
+
+func (s *Store) Config() Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return NormalizeConfig(s.config)
+}
+
+func (s *Store) Record(trace Trace) Trace {
+	s.mu.Lock()
+	s.pruneExpiredLocked(time.Now())
+
+	s.nextID++
+	trace.ID = "trace-" + formatID(s.nextID)
+	if trace.Timestamp.IsZero() {
+		trace.Timestamp = time.Now()
+	}
+	s.traces = append(s.traces, trace)
+	if len(s.traces) > s.capacity {
+		copy(s.traces, s.traces[len(s.traces)-s.capacity:])
+		s.traces = s.traces[:s.capacity]
+	}
+	persistence := s.persistence
+	persist := persistence != nil && persistenceEnabled(s.config)
+	s.mu.Unlock()
+
+	if persist {
+		persistence.enqueue(trace)
+	}
+
+	return trace
+}
+
+// EnablePersistence loads recent JSONL traces and starts the daily writer.
+func (s *Store) EnablePersistence(directory string) error {
+	s.mu.RLock()
+	retentionDays := s.config.Persistence.RetentionDays
+	enabled := persistenceEnabled(s.config)
+	s.mu.RUnlock()
+
+	persistence, loaded, err := newTracePersistence(directory, retentionDays, s.capacity)
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		loaded = nil
+	}
+
+	s.mu.Lock()
+	if s.persistence != nil {
+		s.mu.Unlock()
+		persistence.close()
+		return nil
+	}
+	s.persistence = persistence
+	if len(loaded) > 0 {
+		s.traces = append(loaded, s.traces...)
+		sort.SliceStable(s.traces, func(i, j int) bool {
+			return s.traces[i].Timestamp.Before(s.traces[j].Timestamp)
+		})
+		if len(s.traces) > s.capacity {
+			s.traces = append([]Trace(nil), s.traces[len(s.traces)-s.capacity:]...)
+		}
+		for _, trace := range s.traces {
+			if id := parseTraceID(trace.ID); id > s.nextID {
+				s.nextID = id
+			}
+		}
+		if !s.traces[0].Timestamp.IsZero() {
+			s.startedAt = s.traces[0].Timestamp
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Store) Close() {
+	s.mu.RLock()
+	persistence := s.persistence
+	s.mu.RUnlock()
+	if persistence != nil {
+		persistence.close()
+	}
+}
+
+func (s *Store) TunnelOpened() {
+	s.mu.Lock()
+	s.activeTunnels++
+	s.mu.Unlock()
+}
+
+func (s *Store) TunnelClosed() {
+	s.mu.Lock()
+	if s.activeTunnels > 0 {
+		s.activeTunnels--
+	}
+	s.mu.Unlock()
+}
+
+func (s *Store) Snapshot(limit int) Snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneExpiredLocked(time.Now())
+
+	if limit <= 0 || limit > len(s.traces) {
+		limit = len(s.traces)
+	}
+
+	traces := make([]Trace, 0, limit)
+	for i := len(s.traces) - 1; i >= 0 && len(traces) < limit; i-- {
+		traces = append(traces, s.traces[i])
+	}
+
+	return Snapshot{
+		Metrics:       s.metricsLocked(),
+		Traces:        traces,
+		DisplayTraces: displayTraces(traces, s.config),
+		Series:        buildSeries(s.traces, time.Now(), s.config),
+		Config:        NormalizeConfig(s.config),
+	}
+}
+
+func (s *Store) Metrics() Metrics {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneExpiredLocked(time.Now())
+	return s.metricsLocked()
+}
+
+func (s *Store) pruneExpiredLocked(now time.Time) {
+	days := s.config.Persistence.RetentionDays
+	if days < 1 {
+		days = DefaultRetentionDays
+	}
+	cutoff := startOfLocalDay(now).AddDate(0, 0, -(days - 1))
+	kept := s.traces[:0]
+	for _, trace := range s.traces {
+		if !trace.Timestamp.Before(cutoff) {
+			kept = append(kept, trace)
+		}
+	}
+	s.traces = kept
+}
+
+func (s *Store) metricsLocked() Metrics {
+	var metrics Metrics
+	latencies := make([]int64, 0, len(s.traces))
+	seenFailures := make(map[string]struct{})
+
+	for i := len(s.traces) - 1; i >= 0; i-- {
+		trace := s.traces[i]
+		metrics.RawRequests++
+		if _, _, folded := successFoldGroup(trace, s.config); folded {
+			metrics.IgnoredSuccess++
+			continue
+		}
+		if isFailure(trace) {
+			metrics.RawFailures++
+			key := failureGroupKey(trace, s.config)
+			if key != "" {
+				if _, ok := seenFailures[key]; ok {
+					metrics.RequestBytes += trace.RequestBytes
+					metrics.ResponseBytes += trace.ResponseBytes
+					continue
+				}
+				seenFailures[key] = struct{}{}
+			}
+			metrics.Requests++
+			metrics.Failures++
+		} else {
+			metrics.Requests++
+			metrics.Success++
+			if trace.LatencyMS > 0 {
+				latencies = append(latencies, trace.LatencyMS)
+			}
+		}
+		metrics.RequestBytes += trace.RequestBytes
+		metrics.ResponseBytes += trace.ResponseBytes
+	}
+
+	metrics.ActiveTunnels = s.activeTunnels
+	if metrics.Requests > 0 {
+		metrics.SuccessRate = float64(metrics.Success) / float64(metrics.Requests)
+	}
+	minutes := time.Since(s.startedAt).Minutes()
+	if minutes < 1 {
+		minutes = 1
+	}
+	metrics.RequestsPerMin = float64(metrics.Requests) / minutes
+
+	if len(latencies) > 0 {
+		var sum int64
+		for _, latency := range latencies {
+			sum += latency
+		}
+		metrics.AvgLatencyMS = sum / int64(len(latencies))
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		metrics.P95LatencyMS = percentile95(latencies)
+	}
+
+	return metrics
+}
+
+func displayTraces(traces []Trace, cfg Config) []DisplayTrace {
+	rows := make([]DisplayTrace, 0, len(traces))
+	indexByKey := make(map[string]int)
+	for _, trace := range traces {
+		if key, target, folded := successFoldGroup(trace, cfg); folded {
+			if index, ok := indexByKey[key]; ok {
+				rows[index].GroupCount++
+				rows[index].Children = append(rows[index].Children, trace)
+				continue
+			}
+			indexByKey[key] = len(rows)
+			rows = append(rows, DisplayTrace{
+				Trace:              trace,
+				GroupKey:           key,
+				GroupTarget:        target,
+				GroupCount:         1,
+				ExcludedFromMetric: true,
+				Children:           []Trace{trace},
+			})
+			continue
+		}
+		if !isFailure(trace) {
+			rows = append(rows, DisplayTrace{Trace: trace, GroupCount: 1})
+			continue
+		}
+		key := failureGroupKey(trace, cfg)
+		if key == "" {
+			rows = append(rows, DisplayTrace{Trace: trace, GroupCount: 1})
+			continue
+		}
+		if index, ok := indexByKey[key]; ok {
+			rows[index].GroupCount++
+			rows[index].Children = append(rows[index].Children, trace)
+			continue
+		}
+		indexByKey[key] = len(rows)
+		rows = append(rows, DisplayTrace{
+			Trace:       trace,
+			GroupKey:    key,
+			GroupTarget: failureGroupTarget(trace, cfg),
+			GroupCount:  1,
+			Children:    []Trace{trace},
+		})
+	}
+	for i := range rows {
+		if rows[i].GroupCount <= 1 {
+			rows[i].Children = nil
+		}
+	}
+	return rows
+}
+
+func buildSeries(traces []Trace, now time.Time, cfg Config) []Bucket {
+	cutoff := now.Add(-24 * time.Hour).Truncate(time.Minute)
+	buckets := make(map[int64]*Bucket)
+	latencies := make(map[int64][]int64)
+	seenFailures := make(map[string]struct{})
+
+	for i := len(traces) - 1; i >= 0; i-- {
+		trace := traces[i]
+		if _, _, folded := successFoldGroup(trace, cfg); folded {
+			continue
+		}
+		minute := trace.Timestamp.Truncate(time.Minute)
+		if minute.Before(cutoff) {
+			continue
+		}
+		key := minute.Unix()
+		bucket := buckets[key]
+		if bucket == nil {
+			bucket = &Bucket{Time: minute}
+			buckets[key] = bucket
+		}
+
+		if isFailure(trace) {
+			groupKey := failureGroupKey(trace, cfg)
+			if groupKey != "" {
+				if _, ok := seenFailures[groupKey]; ok {
+					continue
+				}
+				seenFailures[groupKey] = struct{}{}
+			}
+			bucket.Requests++
+			bucket.Failures++
+			continue
+		}
+
+		bucket.Requests++
+		if trace.LatencyMS > 0 {
+			latencies[key] = append(latencies[key], trace.LatencyMS)
+		}
+	}
+
+	series := make([]Bucket, 0, len(buckets))
+	for key, bucket := range buckets {
+		values := latencies[key]
+		if len(values) > 0 {
+			var sum int64
+			for _, latency := range values {
+				sum += latency
+			}
+			bucket.AvgLatencyMS = sum / int64(len(values))
+			sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+			bucket.P95LatencyMS = percentile95(values)
+		}
+		series = append(series, *bucket)
+	}
+	sort.Slice(series, func(i, j int) bool {
+		return series[i].Time.Before(series[j].Time)
+	})
+	return series
+}
+
+func isFailure(trace Trace) bool {
+	return trace.Status == 0 || trace.Status >= 400 || trace.Error != ""
+}
+
+func percentile95(sorted []int64) int64 {
+	index := int(float64(len(sorted))*0.95) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(sorted) {
+		index = len(sorted) - 1
+	}
+	return sorted[index]
+}
+
+func formatID(value int64) string {
+	const digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+	if value == 0 {
+		return "0"
+	}
+	var buf [16]byte
+	i := len(buf)
+	for value > 0 {
+		i--
+		buf[i] = digits[int(value%36)]
+		value /= 36
+	}
+	return string(buf[i:])
+}
+
+func parseTraceID(value string) int64 {
+	raw := strings.TrimPrefix(value, "trace-")
+	parsed, err := strconv.ParseInt(raw, 36, 64)
+	if err != nil {
+		return 0
+	}
+	return parsed
+}

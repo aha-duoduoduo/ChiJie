@@ -1,0 +1,23 @@
+name: chijie-tun
+
+services:
+  chijie:
+    image: "${CHIJIE_IMAGE:?set CHIJIE_IMAGE in .env}"
+    container_name: chijie-tun
+    restart: unless-stopped
+    network_mode: host
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - "${CHIJIE_CONFIG_DIR:-./configs}:/config"
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+    read_only: true
+    tmpfs:
+      - /tmp

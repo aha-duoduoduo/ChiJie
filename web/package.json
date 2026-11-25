@@ -1,0 +1,21 @@
+{
+  "name": "chijie-admin",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "lint": "eslint src",
+    "prebuild": "npm run lint"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "eslint": "9.39.4",
+    "eslint-plugin-react": "7.37.5",
+    "globals": "16.5.0"
+  }
+}
